@@ -1,0 +1,3 @@
+[submodule "mort_data"]
+	path = mort_data
+	url = https://github.com/mma-fsa/mort_data
