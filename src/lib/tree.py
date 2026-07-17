@@ -14,7 +14,14 @@ def convert_to_dataframe(matrix, column_names=None):
 
 class PoissonDecisionTree():
     
-    def __init__(self, actual_col, offset_col, params=None):
+    def __init__(
+        self,
+        actual_col,
+        offset_col,
+        params=None,
+        monotone_constraints=None,
+        interaction_constraints=None,
+    ):
         self.actual_col = actual_col
         self.offset_col = offset_col
         self._params = {
@@ -28,8 +35,139 @@ class PoissonDecisionTree():
         }
         if params is not None:
             self._params.update(params)
+        self._monotone_constraints = monotone_constraints
+        self._interaction_constraints = interaction_constraints
         self._preproc = None
         self._bst = None
+        self._feature_columns = None
+        self._str_cols = None
+        self._categorical_categories = None
+        self._feature_names = None
+
+    def _require_feature_names(self):
+        if self._feature_names is None:
+            raise ValueError("Model features are not available before fit().")
+        return self._feature_names
+
+    def _resolve_feature_index(self, feature_name, feature_index_map):
+        feature_names = self._require_feature_names()
+        if isinstance(feature_name, (int, np.integer)):
+            idx = int(feature_name)
+            if idx < 0 or idx >= len(feature_names):
+                raise ValueError(
+                    f"Feature index out of bounds for constraints: {feature_name}"
+                )
+            return idx
+
+        if feature_name not in feature_index_map:
+            raise ValueError(
+                f"Unknown feature in constraints: {feature_name}. "
+                f"Available features: {feature_names}"
+            )
+        return feature_index_map[feature_name]
+
+    def _build_monotone_constraints_param(self):
+        if self._monotone_constraints is None:
+            return None
+        if isinstance(self._monotone_constraints, str):
+            return self._monotone_constraints
+
+        feature_names = self._require_feature_names()
+        feature_index_map = {name: i for i, name in enumerate(feature_names)}
+        n_features = len(feature_names)
+
+        if isinstance(self._monotone_constraints, dict):
+            values = [0] * n_features
+            for feature_name, direction in self._monotone_constraints.items():
+                idx = self._resolve_feature_index(feature_name, feature_index_map)
+                direction_int = int(direction)
+                if direction_int not in (-1, 0, 1):
+                    raise ValueError(
+                        f"Monotone constraint for {feature_name} must be -1, 0, or 1."
+                    )
+                values[idx] = direction_int
+            return "(" + ",".join(str(v) for v in values) + ")"
+
+        values = [int(v) for v in self._monotone_constraints]
+        if len(values) != n_features:
+            raise ValueError(
+                "Monotone constraints length must equal number of model features. "
+                f"Got {len(values)} constraints for {n_features} features."
+            )
+        bad_values = [v for v in values if v not in (-1, 0, 1)]
+        if bad_values:
+            raise ValueError("Monotone constraints must only contain -1, 0, or 1 values.")
+
+        return "(" + ",".join(str(v) for v in values) + ")"
+
+    def _build_interaction_constraints_param(self):
+        if self._interaction_constraints is None:
+            return None
+        if isinstance(self._interaction_constraints, str):
+            return self._interaction_constraints
+
+        feature_names = self._require_feature_names()
+        feature_index_map = {name: i for i, name in enumerate(feature_names)}
+
+        groups = []
+        raw_constraints = self._interaction_constraints
+
+        if isinstance(raw_constraints, dict):
+            for key, include_group in raw_constraints.items():
+                if not include_group:
+                    continue
+                if isinstance(key, (tuple, list)):
+                    groups.append(list(key))
+                else:
+                    groups.append([key])
+        else:
+            groups = list(raw_constraints)
+
+        parsed_groups = []
+        for group in groups:
+            if isinstance(group, (str, int, np.integer)):
+                group_values = [group]
+            else:
+                group_values = list(group)
+
+            indices = [
+                self._resolve_feature_index(feature_name, feature_index_map)
+                for feature_name in group_values
+            ]
+            parsed_groups.append(indices)
+
+        return json.dumps(parsed_groups)
+        
+    def _prepare_input_df(self, df : pd.DataFrame) -> pd.DataFrame:
+        if self._preproc is None:
+            raise ValueError("Model must be fit before preparing input data.")
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame(df)
+
+        if self._feature_columns is None:
+            raise ValueError("No fitted feature columns are available.")
+
+        missing = [c for c in self._feature_columns if c not in df.columns]
+        if missing:
+            raise KeyError(f"Missing required columns for prediction: {missing}")
+
+        df_for_model = df.loc[:, self._feature_columns].copy()
+
+        if self._str_cols:
+            for col in self._str_cols:
+                if col not in df_for_model.columns:
+                    continue
+                if self._categorical_categories is not None and col in self._categorical_categories:
+                    categories = self._categorical_categories[col]
+                    df_for_model[col] = pd.Categorical(
+                        df_for_model[col].astype("string"),
+                        categories=categories,
+                    )
+                else:
+                    df_for_model[col] = df_for_model[col].astype("category")
+                df_for_model[col] = df_for_model[col].cat.codes.astype("int8")
+
+        return df_for_model
         
     def fit(self, df : pd.DataFrame):
         
@@ -38,35 +176,41 @@ class PoissonDecisionTree():
         if not self.offset_col in df.columns:
             raise Exception(f"Missing column (for offset): {self.offset_col}")
         
-        str_cols = list(map(
-            lambda c: str(c),
-            df.select_dtypes(
-            include=['object', 'string']).columns
-        ))
-        
         response_cols = [
             self.actual_col,
             self.offset_col
         ]
 
-        num_cols = list(
-            set(df.columns)
-            .difference(set(str_cols))
-            .difference(set(response_cols))
-        )
+        self._str_cols = [
+            c for c in df.select_dtypes(
+                include=['object', 'string']
+            ).columns.tolist()
+            if c not in response_cols
+        ]
+        self._feature_columns = [
+            c for c in df.columns
+            if c not in response_cols
+        ]
+
+        num_cols = [
+            c for c in self._feature_columns
+            if c not in self._str_cols
+        ]
 
         # Convert categorical columns into explicit 0/1 indicator columns so that
         # XGBoost can split them at a clean threshold like 0.5 instead of an
         # arbitrary negative threshold produced by the one-hot encoder.
         df_for_model = df.copy()
-        for col in str_cols:
+        self._categorical_categories = {}
+        for col in self._str_cols:
             if col in df_for_model.columns:
                 ser = df_for_model[col].astype("category")
+                self._categorical_categories[col] = list(ser.cat.categories)
                 df_for_model[col] = ser.cat.codes.astype("int8")
 
         xfrm = [
             (
-                "num", "passthrough", num_cols + str_cols
+                "num", "passthrough", num_cols + self._str_cols
             )
         ]
         
@@ -79,20 +223,30 @@ class PoissonDecisionTree():
         X_mat = self._preproc.fit_transform(df_for_model)
         offset = df_for_model[self.offset_col].to_numpy("float64")
         y = df_for_model[self.actual_col].to_numpy("float64")
-        f_names = self._preproc.get_feature_names_out().tolist()
+        self._feature_names = self._preproc.get_feature_names_out().tolist()
         xgb_mat = xgb.DMatrix(
             data=X_mat,
             label=y,
             base_margin = np.log(offset),
-            feature_names=f_names
+            feature_names=self._feature_names
         )
         df_X_mat = convert_to_dataframe(
             X_mat,
-            column_names=f_names
+            column_names=self._feature_names
         ) 
         
+        train_params = dict(self._params)
+
+        monotone_constraints = self._build_monotone_constraints_param()
+        if monotone_constraints is not None:
+            train_params["monotone_constraints"] = monotone_constraints
+
+        interaction_constraints = self._build_interaction_constraints_param()
+        if interaction_constraints is not None:
+            train_params["interaction_constraints"] = interaction_constraints
+
         self._bst = xgb.train(
-            params = self._params,
+            params = train_params,
             dtrain=xgb_mat,
             num_boost_round=1
         )
@@ -107,6 +261,24 @@ class PoissonDecisionTree():
             offset)
         
         self._tree_df = pd.DataFrame(self._tree_data)
+
+    def predict(self, df : pd.DataFrame):
+        if self._bst is None or self._preproc is None:
+            raise ValueError("Model must be fit before calling predict().")
+
+        df_for_model = self._prepare_input_df(df)
+        X_mat = self._preproc.transform(df_for_model)
+
+        offset = np.ones(len(df_for_model), dtype="float64")
+        if self.offset_col in df.columns:
+            offset = df[self.offset_col].to_numpy("float64")
+
+        xgb_mat = xgb.DMatrix(
+            data=X_mat,
+            feature_names=self._feature_names,
+            base_margin=np.log(offset),
+        )
+        return self._bst.predict(xgb_mat)
         
     def __str__(self):
         return pretty_print_compact_tree(self._tree_df)

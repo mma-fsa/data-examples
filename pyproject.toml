@@ -1,0 +1,30 @@
+[project]
+name = "data-examples"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb-sqlalchemy>=1.5.4.3",
+    "formulaic>=1.2.2",
+    "glum>=3.4.1",
+    "jupysql>=0.11.1",
+    "matplotlib>=3.11.0",
+    "openpyxl>=3.1.5",
+    "pandas<3.0.0",
+    "plotly>=6.9.0",
+    "plotnine>=0.15.7",
+    "pyarrow>=25.0.0",
+    "scikit-learn>=1.9.0",
+    "scikit-misc>=0.5.2",
+    "xgboost-cpu==3.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "duckdb>=1.5.4",
+    "duckdb-engine>=0.17.0",
+    "ipykernel>=7.3.0",
+    "jupysql>=0.11.1",
+    "sqlalchemy>=2.0.51",
+]
