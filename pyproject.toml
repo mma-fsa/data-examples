@@ -17,6 +17,7 @@ dependencies = [
     "pyarrow>=25.0.0",
     "scikit-learn>=1.9.0",
     "scikit-misc>=0.5.2",
+    "statsmodels>=0.14.4",
     "xgboost-cpu==3.2.0",
 ]
 
