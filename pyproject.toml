@@ -17,6 +17,7 @@ dependencies = [
     "pyarrow>=25.0.0",
     "scikit-learn>=1.9.0",
     "scikit-misc>=0.5.2",
+    "shap>=0.52.0",
     "statsmodels>=0.14.4",
     "xgboost-cpu==3.2.0",
 ]
@@ -28,4 +29,5 @@ dev = [
     "ipykernel>=7.3.0",
     "jupysql>=0.11.1",
     "sqlalchemy>=2.0.51",
+    "databricks-connect<18.0.0"
 ]
