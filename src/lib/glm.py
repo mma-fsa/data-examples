@@ -1,7 +1,7 @@
 import pandas as pd, numpy as np
 import formulaic as frm
 from pandas.api.types import is_numeric_dtype, is_object_dtype, is_string_dtype
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence, Any
 import glum as glm
 
 def get_coef_table(glmnet : glm.GeneralizedLinearRegressor, alpha_index : int) -> pd.Series:
@@ -152,7 +152,7 @@ class PoissonGLMFactorAnalysis():
         self._set_group_state_from_factor_map(normalized_factor_map)
     
     # do not modify signature of this
-    def get_factor_analysis(self, df_traim : pd.DataFrame) -> List[pd.DataFrame]:
+    def get_factor_analysis(self, df_traim : pd.DataFrame, context: Dict[str, Any] = {}) -> List[pd.DataFrame]:
         """
             Returns a list of dataframes. Each dataframe contains a subset of the columns
             present in df_train with an additional column called factor.  Using all the
@@ -181,7 +181,7 @@ class PoissonGLMFactorAnalysis():
                 continue
 
             pred_grid = self._create_pred_grid(df_train, group_variables)
-            model_matrix = self.model_spec.get_model_matrix(pred_grid)
+            model_matrix = self.model_spec.get_model_matrix(pred_grid, context=context)
             linear_predictor = model_matrix.loc[:, group_columns].to_numpy() @ self.coefficients.loc[group_columns].to_numpy()
 
             factor_table = pred_grid.loc[:, group_variables].copy()
