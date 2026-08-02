@@ -56,6 +56,43 @@ def set_df_categoricals(df: pd.DataFrame, default_levels: Dict[str, str]) -> pd.
 
     return result
 
+def get_selection_factor_terms(policy_year_col_name, sel_factor_col_name, sel_factor_lengths):
+    sel_factor_terms = []
+    for sel_factor_grp, sel_per_len in sel_factor_lengths.items():
+        sel_factor_terms.append(
+            '{{{} == "{}"}} + '
+            '({{{} == "{}"}}:' 
+            'selection_factor({}, sel_per_len={}))'
+            .format(
+                sel_factor_col_name, sel_factor_grp,
+                sel_factor_col_name, sel_factor_grp,
+                policy_year_col_name, sel_per_len
+            )
+        )
+    return sel_factor_terms
+
+def selection_factor(policy_year, sel_per_len, interp_start=None, interp_pwr=0.85):
+    import numpy as np
+
+    if interp_start is None:
+        # we want to start interpolating towards 1.0 after a certain point,
+        # these values (7 and 5) were found by trial and error to get a good fit 
+        sel_period_start_factor = 7 if sel_per_len > 15 else 5
+        interp_start = min([
+            sel_per_len - 1,
+            sel_per_len - sel_per_len // sel_period_start_factor
+        ])
+
+    duration = np.minimum(sel_per_len, policy_year)
+
+    # interpolate near the end point so that we actually convert to 1.0,
+    # rather than asympototically approaching it 
+    interp_end = sel_per_len
+    c1 = ((interp_end - duration) / (interp_end - interp_start)) ** interp_pwr
+    c1 = np.minimum(1, np.maximum(0, c1))
+
+    return c1 * np.log(duration) + (1 - c1) * np.log(interp_end)
+
 class PoissonGLMFactorAnalysis():
     
     # do not modify signature of this
