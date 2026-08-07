@@ -668,9 +668,6 @@ class StepWiseGroupedPoissonGLM(GroupedPoissonGLM):
                 trial_terms = [*selected_terms, term]
                 trial_fit, _, _ = self._fit_terms(X_df, y_df, trial_terms, warm_start=warm_theta)
 
-                if trial_fit.bic_ is None:
-                    raise RuntimeError("Candidate model did not produce a BIC value.")
-
                 trial_score = self._selection_score(trial_fit)
                 trial_success = bool(getattr(trial_fit.result_, "success", True))
 
@@ -684,9 +681,10 @@ class StepWiseGroupedPoissonGLM(GroupedPoissonGLM):
                 )
 
                 if retry_cold_start:
+                    self._log(
+                        f"Retrying term {term} with cold start due to convergence issues or poor score."
+                    )
                     cold_fit, _, _ = self._fit_terms(X_df, y_df, trial_terms, warm_start=None)
-                    if cold_fit.bic_ is None:
-                        raise RuntimeError("Cold-start candidate model did not produce a BIC value.")
 
                     cold_score = self._selection_score(cold_fit)
                     cold_success = bool(getattr(cold_fit.result_, "success", True))
@@ -696,8 +694,6 @@ class StepWiseGroupedPoissonGLM(GroupedPoissonGLM):
                         trial_score = cold_score
                         trial_success = cold_success
 
-                if trial_fit.bic_ is None:
-                    raise RuntimeError("Candidate model did not produce a BIC value.")
                 score_change = current_score - trial_score
                 candidate_results.append((score_change, term, trial_fit))
                 row = {
@@ -747,8 +743,6 @@ class StepWiseGroupedPoissonGLM(GroupedPoissonGLM):
                 "n_candidates_retained": retained_limit,
             })
             current_fit = best_fit
-            if current_fit.bic_ is None:
-                raise RuntimeError("Accepted model did not produce a BIC value.")
             current_score = self._selection_score(current_fit)
             remaining_terms = [term for term in retained_candidates if term not in selected_terms]
             self._log(f"Accepted term {selected_terms[-1]}; current {metric_label}={current_score:.6f}")
