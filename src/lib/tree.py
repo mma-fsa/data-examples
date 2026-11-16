@@ -26,9 +26,10 @@ class PoissonDecisionTree():
         self.offset_col = offset_col
         self._params = {
             'objective': 'count:poisson',
-            'max_depth': 3,
-            'tree_method': 'exact',
+            # 'hist' (unlike 'exact') supports native categorical splits.
+            'tree_method': 'hist',
             'grow_policy': 'lossguide',
+            'max_depth': 3,
             'min_child_weight': 10,
             'gamma': 1.0,
             'seed': 0,
@@ -43,6 +44,7 @@ class PoissonDecisionTree():
         self._str_cols = None
         self._categorical_categories = None
         self._feature_names = None
+        self._feature_types = None
 
     def _require_feature_names(self):
         if self._feature_names is None:
@@ -183,7 +185,7 @@ class PoissonDecisionTree():
 
         self._str_cols = [
             c for c in df.select_dtypes(
-                include=['object', 'string']
+                include=['object', 'string', 'category']
             ).columns.tolist()
             if c not in response_cols
         ]
@@ -197,9 +199,10 @@ class PoissonDecisionTree():
             if c not in self._str_cols
         ]
 
-        # Convert categorical columns into explicit 0/1 indicator columns so that
-        # XGBoost can split them at a clean threshold like 0.5 instead of an
-        # arbitrary negative threshold produced by the one-hot encoder.
+        # Encode categorical columns as integer category codes; combined with
+        # feature_types="c" and enable_categorical=True below, XGBoost treats
+        # these as true categorical splits (arbitrary category subsets) rather
+        # than ordinal numeric thresholds over the codes.
         df_for_model = df.copy()
         self._categorical_categories = {}
         for col in self._str_cols:
@@ -224,11 +227,17 @@ class PoissonDecisionTree():
         offset = df_for_model[self.offset_col].to_numpy("float64")
         y = df_for_model[self.actual_col].to_numpy("float64")
         self._feature_names = self._preproc.get_feature_names_out().tolist()
+        self._feature_types = [
+            "c" if c in self._str_cols else "q"
+            for c in self._feature_names
+        ]
         xgb_mat = xgb.DMatrix(
             data=X_mat,
             label=y,
             base_margin = np.log(offset),
-            feature_names=self._feature_names
+            feature_names=self._feature_names,
+            feature_types=self._feature_types,
+            enable_categorical=True,
         )
         df_X_mat = convert_to_dataframe(
             X_mat,
@@ -258,7 +267,8 @@ class PoissonDecisionTree():
             tree_json, 
             df_X_mat,
             y, 
-            offset)
+            offset,
+            categorical_categories=self._categorical_categories)
         
         self._tree_df = pd.DataFrame(self._tree_data)
 
@@ -276,6 +286,8 @@ class PoissonDecisionTree():
         xgb_mat = xgb.DMatrix(
             data=X_mat,
             feature_names=self._feature_names,
+            feature_types=self._feature_types,
+            enable_categorical=True,
             base_margin=np.log(offset),
         )
         return self._bst.predict(xgb_mat)
@@ -358,7 +370,35 @@ def split_mask(x_col, split_value, missing_go_to, yes_child_id, no_child_id, mis
     return go_yes, go_missing
 
 
-def collect_split_stats(node, X_sub, y_sub, exposure_sub, path_conditions=None, show_missing=False):
+def _category_level_names(feature, codes, categorical_categories):
+    """
+    Translate categorical split codes (as stored in XGBoost's split_condition)
+    into their original category level names, falling back to the raw code
+    when no mapping is available.
+    """
+    levels = None
+    if categorical_categories is not None:
+        levels = categorical_categories.get(feature)
+
+    names = []
+    for code in codes:
+        code_int = int(code)
+        if levels is not None and 0 <= code_int < len(levels):
+            names.append(str(levels[code_int]))
+        else:
+            names.append(str(code_int))
+    return names
+
+
+def collect_split_stats(
+    node,
+    X_sub,
+    y_sub,
+    exposure_sub,
+    path_conditions=None,
+    show_missing=False,
+    categorical_categories=None,
+):
     """
     Recursively compute exact Poisson deviance reduction for each split,
     while storing a human-readable chain of split conditions.
@@ -375,6 +415,10 @@ def collect_split_stats(node, X_sub, y_sub, exposure_sub, path_conditions=None, 
         Exposure reaching this node.
     path_conditions : list[str] | None
         List of human-readable conditions defining the node.
+    categorical_categories : dict[str, list] | None
+        Maps a categorical feature name to its ordered list of category
+        level names (index == category code), used to render categorical
+        splits with their actual level names instead of raw codes.
 
     Returns
     -------
@@ -400,9 +444,31 @@ def collect_split_stats(node, X_sub, y_sub, exposure_sub, path_conditions=None, 
     left_id = left_child["nodeid"]
     right_id = right_child["nodeid"]
 
+    # A categorical split's condition is a list of category codes that take
+    # the "yes" branch; a numeric split's condition is a single threshold.
+    is_categorical_split = isinstance(threshold, list)
+
     xcol = X_sub[feature]
     is_missing = pd.isna(xcol).to_numpy()
-    go_yes = (~is_missing) & (xcol.to_numpy() < threshold)
+    missing_text = f"{feature} missing"
+
+    if is_categorical_split:
+        go_yes = (~is_missing) & np.isin(xcol.to_numpy(), threshold)
+        level_names = _category_level_names(feature, threshold, categorical_categories)
+        if len(level_names) == 1:
+            yes_text = f"{feature} = {level_names[0]}"
+            no_text = f"{feature} != {level_names[0]}"
+        else:
+            levels_joined = ", ".join(level_names)
+            yes_text = f"{feature} in {{{levels_joined}}}"
+            no_text = f"{feature} not in {{{levels_joined}}}"
+        split_label = yes_text
+    else:
+        go_yes = (~is_missing) & (xcol.to_numpy() < threshold)
+        yes_text = f"{feature} < {threshold}"
+        no_text = f"{feature} >= {threshold}"
+        split_label = yes_text
+
     go_no = (~is_missing) & (~go_yes)
     go_missing = is_missing
 
@@ -411,28 +477,22 @@ def collect_split_stats(node, X_sub, y_sub, exposure_sub, path_conditions=None, 
 
     if yes_id == left_id:
         left_mask |= go_yes
-        yes_text = f"{feature} < {threshold}"
     elif yes_id == right_id:
         right_mask |= go_yes
-        yes_text = f"{feature} < {threshold}"
     else:
         raise ValueError("yes child id not found among node children")
 
     if no_id == left_id:
         left_mask |= go_no
-        no_text = f"{feature} >= {threshold}"
     elif no_id == right_id:
         right_mask |= go_no
-        no_text = f"{feature} >= {threshold}"
     else:
         raise ValueError("no child id not found among node children")
 
     if missing_id == left_id:
         left_mask |= go_missing
-        missing_text = f"{feature} missing"
     elif missing_id == right_id:
         right_mask |= go_missing
-        missing_text = f"{feature} missing"
     else:
         raise ValueError("missing child id not found among node children")
 
@@ -485,7 +545,7 @@ def collect_split_stats(node, X_sub, y_sub, exposure_sub, path_conditions=None, 
 
     results.append({
         "nodeid": node["nodeid"],
-        "split_label": f"{feature} < {threshold}",
+        "split_label": split_label,
         "path_pretty": " AND ".join(path_conditions) if path_conditions else "ROOT",
         "left_path_pretty": " AND ".join(left_conditions),
         "right_path_pretty": " AND ".join(right_conditions),
@@ -518,7 +578,8 @@ def collect_split_stats(node, X_sub, y_sub, exposure_sub, path_conditions=None, 
             X_sub.iloc[left_mask].copy(),
             y_left,
             exp_left,
-            left_conditions
+            left_conditions,
+            categorical_categories=categorical_categories,
         )
     )
 
@@ -528,7 +589,8 @@ def collect_split_stats(node, X_sub, y_sub, exposure_sub, path_conditions=None, 
             X_sub.iloc[right_mask].copy(),
             y_right,
             exp_right,
-            right_conditions
+            right_conditions,
+            categorical_categories=categorical_categories,
         )
     )
 
@@ -564,7 +626,7 @@ def pretty_print_split_stats(split_df, digits=4, sort_by_node=True):
     for _, row in df.iterrows():
         lines.append(f"Node {row['nodeid']}")
         lines.append(f"  Path: {row['path_pretty']}")
-        lines.append(f"  Split: {row['feature']} < {fmt(row['threshold'])}")
+        lines.append(f"  Split: {row['split_label']}")
 
         lines.append("  Parent")
         lines.append(
